@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import numpy as np
+import warnings
 import matplotlib.pyplot as plt
 
 import astropy.constants as c
@@ -15,6 +16,16 @@ except ImportError:
     print('    https://github.com/birnstiel/widget\n')
     print('and install it with this command from within the repository\n')
     print('    pip install .')
+
+try:
+    from numba import njit, jit
+except ImportError:
+    warnings.warn('numba not available, calculation will be ~8x slower; better install numba!')
+
+    def njit(ob):
+        return ob
+
+    jit = njit
 
 # define constants
 
@@ -48,16 +59,14 @@ def smoothstep(x, w):
         the function at every given x value
 
     """
-    nd = np.ndim(x)
-    x = np.array(x, ndmin=1)
-    y = np.zeros(np.size(x))
+    isscalar = np.isscalar(x)
 
-    for i, r in enumerate(x):
-        if r <= 0.:
-            y[i] = 0.5 * np.exp(r / w)
-        else:
-            y[i] = 1. - 0.5 * np.exp(-r / w)
-    if nd == 0:
+    x = np.array([1]) * x
+    mask = x >= 0
+    y = 0.5 * np.exp(np.minimum(x / w, 709.7))
+    y[mask] = 1. - 0.5 * np.exp(-x[mask] / w)
+
+    if isscalar:
         return y[0]
     else:
         return y
@@ -217,6 +226,63 @@ def gas_timestep(dt, x, alpha, T, sig_g):
     return sig_g
 
 
+@njit
+def tridag(a, b, c, r, n):
+    """
+    Solves a tridiagnoal matrix equation
+
+        M * u  =  r
+
+    where M is tridiagonal, and u and r are vectors of length n.
+
+    Arguments:
+    ----------
+
+    a : array
+        lower diagonal entries
+
+    b : array
+        diagonal entries
+
+    c : array
+        upper diagonal entries
+
+    r : array
+        right hand side vector
+
+    n : int
+        size of the vectors
+
+    Returns:
+    --------
+
+    u : array
+        solution vector
+    """
+    gam = np.zeros(n)
+    u = np.zeros(n)
+
+    if b[0] == 0.:
+        raise ValueError('tridag: rewrite equations')
+
+    bet = b[0]
+
+    u[0] = r[0] / bet
+
+    for j in np.arange(1, n):
+        gam[j] = c[j - 1] / bet
+        bet = b[j] - a[j] * gam[j]
+
+        if bet == 0:
+            raise ValueError('tridag failed')
+        u[j] = (r[j] - a[j] * u[j - 1]) / bet
+
+    for j in np.arange(n - 2, -1, -1):
+        u[j] = u[j] - gam[j + 1] * u[j + 1]
+    return u
+
+
+@jit
 def impl_donorcell_adv_diff_delta(n_x, x, Diff, v, g, h, K, L, u_in, dt, pl, pr, ql, qr, rl, rr):
     """
     Implicit donor cell advection-diffusion scheme with piecewise constant values
@@ -277,14 +343,13 @@ def impl_donorcell_adv_diff_delta(n_x, x, Diff, v, g, h, K, L, u_in, dt, pl, pr,
         the updated values of u(x) after timestep dt
 
     """
-    from numpy import zeros
-    A = zeros(n_x)
-    B = zeros(n_x)
-    C = zeros(n_x)
-    D = zeros(n_x)
-    D05 = zeros(n_x)
-    h05 = zeros(n_x)
-    rhs = zeros(n_x)
+    A = np.zeros(n_x)
+    B = np.zeros(n_x)
+    C = np.zeros(n_x)
+    D = np.zeros(n_x)
+    D05 = np.zeros(n_x)
+    h05 = np.zeros(n_x)
+    rhs = np.zeros(n_x)
     #
     # calculate the arrays at the interfaces
     #
@@ -339,71 +404,12 @@ def impl_donorcell_adv_diff_delta(n_x, x, Diff, v, g, h, K, L, u_in, dt, pl, pr,
     #
     # solve for u2
     #
+
     u2 = tridag(A, B, C, rhs, n_x)
-    #
-    # update u
-    # u = u2   # old way
-    #
+
     u_out = u_in + u2  # delta way
 
     return u_out
-
-
-def tridag(a, b, c, r, n):
-    """
-    Solves a tridiagnoal matrix equation
-
-        M * u  =  r
-
-    where M is tridiagonal, and u and r are vectors of length n.
-
-    Arguments:
-    ----------
-
-    a : array
-        lower diagonal entries
-
-    b : array
-        diagonal entries
-
-    c : array
-        upper diagonal entries
-
-    r : array
-        right hand side vector
-
-    n : int
-        size of the vectors
-
-    Returns:
-    --------
-
-    u : array
-        solution vector
-    """
-    import numpy as np
-
-    gam = np.zeros(n)
-    u = np.zeros(n)
-
-    if b[0] == 0.:
-        raise ValueError('tridag: rewrite equations')
-
-    bet = b[0]
-
-    u[0] = r[0] / bet
-
-    for j in np.arange(1, n):
-        gam[j] = c[j - 1] / bet
-        bet = b[j] - a[j] * gam[j]
-
-        if bet == 0:
-            raise ValueError('tridag failed')
-        u[j] = (r[j] - a[j] * u[j - 1]) / bet
-
-    for j in np.arange(n - 2, -1, -1):
-        u[j] = u[j] - gam[j + 1] * u[j + 1]
-    return u
 
 
 def main():
