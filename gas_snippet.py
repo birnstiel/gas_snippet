@@ -27,57 +27,173 @@ m_star = c.M_sun.cgs.value
 Grav = c.G.cgs.value
 
 
-def main():
+def smoothstep(x, w):
+    """
+    Produces an "smoothed heaviside" function
 
-    # define grids
+    y = 1/2*exp(x/w)       if x <= 0
+    y = 1-1/2*exp(-x/w)    if x >  0
 
-    nr = 1000
-    nt = 200
+    Arguments
+    ---------
+    x : array-like
+        input x-array
 
-    xi = np.logspace(-1, 3, nr + 1) * au
-    x = 0.5 * (xi[1:] + xi[:-1])
+    w : float
+        width of the transition
 
-    time = np.logspace(-1, 6, nt - 1) * year
+    Output
+    ------
+    y : array-like
+        the function at every given x value
 
-    # define initial condition
+    """
+    nd = np.ndim(x)
+    x = np.array(x, ndmin=1)
+    y = np.zeros(np.size(x))
 
-    time = np.hstack((0, time))
-    sig_0 = 200. * (x / au)**-1
-    sig_0[x > 100 * au] = 1e-100
-    alpha = np.ones_like(x) * 1e-2
-    T = 200 * (x / au)**-0.5
-
-    # iteration
-
-    sig_g = np.zeros([nt, nr])
-    sig_g[0] = sig_0
-    sig = sig_0.copy()
-
-    for it in range(nt - 1):
-        dt = time[it + 1] - time[it]
-
-        sig = gas_timestep(dt, x, alpha, T, sig)
-        sig_g[it + 1] = sig
-
-    # plotting
-
-    if has_widget:
-        widget.plotter(x / au, sig_g, times=time / year,
-                       xlog=True, ylog=True, ylim=[1e-4, 1e4],
-                       xlabel='$r$ [au]', ylabel='$\Sigma_\mathrm{g}$ [g cm$^{-2}$]')
+    for i, r in enumerate(x):
+        if r <= 0.:
+            y[i] = 0.5 * np.exp(r / w)
+        else:
+            y[i] = 1. - 0.5 * np.exp(-r / w)
+    if nd == 0:
+        return y[0]
     else:
-        f, ax = plt.subplots()
-        ax.loglog(x / au, sig_g[-1])
-        ax.set_ylim(1e-4, 1e4)
-        ax.set_xlabel('$r$ [au]')
-        ax.set_ylabel('$\Sigma_\mathrm{gas}$ [g/cm$^3$]')
+        return y
 
-    plt.show()
+
+def calc_alpha(r, sig, alpha_dead=1e-4, alpha_active=1e-2, sig_dz=200., dsigma=20.):
+    """
+    Returns an alpha array, given the gas surface density and the radial grid.
+
+    Arguments:
+    ----------
+
+    r : array
+        radial grid [cm]
+
+    sig : array
+        gas surface density on grid r [g/cm^2]
+
+    Keywords:
+    ---------
+
+    alpha_dead, alpha_active : float
+        the active and dead values of alpha
+
+    sig_dz : float
+        the surface density at which alpha drops towards alpha_dead
+
+    """
+    return alpha_active - (alpha_active - alpha_dead) * smoothstep((sig - sig_dz), dsigma)
+
+
+def smooth_alpha(alpha, stencil=5):
+    """
+    Smoothes alpha by a running weighted average
+
+    Arguments:
+    ----------
+
+    alpha: array
+        turbulence parameter on grid r
+
+    Output:
+    -------
+
+    alpha : array
+        smoothed turbulence parameter
+    """
+    n_ghost = stencil // 2
+    a_out = np.hstack((
+        alpha[0] * np.ones(n_ghost),
+        alpha,
+        alpha[-1] * np.ones(n_ghost)))
+
+    n = len(a_out)
+
+    return np.sum([a_out[stencil - 1 - s: n - s] for s in range(stencil)], 0) / stencil
+
+
+def gas_timestep_active_dead(dt, x, T, sig_g, sig_thresh=200.0,
+                             alpha_active=1e-2, alpha_dead=1e-4, dsigma=20.0):
+    """
+    Does a layered accretion gas time step, distinguishing between active
+    and dead layer
+
+    Arguments:
+    ----------
+
+    dt : float
+        length of time step [s]
+
+    x, T, sig_g : arrays
+        radial grid x and on this grid: temperature T [K] and surface density
+        sig_g [g/cm^2]
+
+    sig_thresh : float
+        at which gas surface density to transition from active to dead
+
+    alpha_active, alpha_dead : float
+        active and dead-zone alpha values
+
+    Output:
+    -------
+
+    sig, alpha
+
+    sig : array
+        updated gas surface density
+
+    alpha : array
+        mid-plane gas surface density
+    """
+
+    # find the active and dead surface densities
+
+    sigma_active = np.minimum(sig_g, sig_thresh)
+    sigma_dead = np.maximum(sig_g - sigma_active, 1e-100)
+
+    # assign the active and dead alpha values
+
+    alpha_a = alpha_active * np.ones_like(x)
+    alpha_d = calc_alpha(x, sig_g, alpha_dead=alpha_dead,
+                         alpha_active=alpha_active, sig_dz=sig_thresh, dsigma=dsigma)
+    alpha_d = smooth_alpha(alpha_d, stencil=3)
+
+    # evolve the two surface densities separately
+
+    sig_dead = gas_timestep(dt, x, alpha_d, T, sigma_dead)
+    sig_active = gas_timestep(dt, x, alpha_a, T, sigma_active)
+
+    # calculate the total surface density and mid-plane alpha
+
+    sig = sig_dead + sig_active
+    alpha = np.minimum(alpha_a, alpha_d)
+
+    return sig, alpha
 
 
 def gas_timestep(dt, x, alpha, T, sig_g):
     """
-    Does an implicit time step for the gas surface density
+    Does an implicit time step for the gas surface density:
+
+    Arguments:
+    ----------
+
+    dt : float
+        time step [s]
+
+    x, alpha, T, sig_g : arrays
+        radial grid x, and on the same grid, turbulence alpha, temperature T,
+        and gas surface density sig_g
+
+    Output:
+    -------
+
+    sig : float
+        updated surface density after time step dt.
     """
     nr = len(x)
 
@@ -290,5 +406,59 @@ def tridag(a, b, c, r, n):
     return u
 
 
+def main():
+
+    # define grids
+
+    nr = 1000
+    nt = 2000
+
+    xi = np.logspace(-1, 3, nr + 1) * au
+    x = 0.5 * (xi[1:] + xi[:-1])
+
+    time = np.logspace(-1, 6, nt - 1) * year
+
+    # define initial condition
+
+    time = np.hstack((0, time))
+    sig_0 = 200. * (x / au)**-1
+    sig_0[x > 100 * au] = 1e-100
+    alpha = calc_alpha(x, sig_0)
+    T = 200 * (x / au)**-0.5
+
+    # iteration
+
+    sig_g = np.zeros([nt, nr])
+    sig_g[0] = sig_0
+    alpha_out = np.zeros_like(sig_g)
+    alpha_out[0] = alpha
+    sig = sig_0.copy()
+
+    for it in range(nt - 1):
+        dt = time[it + 1] - time[it]
+
+        # sig = gas_timestep(dt, x, alpha, T, sig)
+        sig, alpha = gas_timestep_active_dead(dt, x, T, sig, dsigma=5.0)
+        sig_g[it + 1] = sig
+        alpha_out[it + 1] = alpha
+
+    # plotting
+
+    if has_widget:
+        widget.plotter(x / au, sig_g, data2=[alpha_out], times=time / year,
+                       xlog=True, ylog=True, ylim=[1e-4, 1e4],
+                       xlabel='$r$ [au]', ylabel='$\Sigma_\mathrm{g}$ [g cm$^{-2}$]')
+    else:
+        f, ax = plt.subplots()
+        ax.loglog(x / au, sig_g[-1])
+        ax.set_ylim(1e-4, 1e4)
+        ax.set_xlabel('$r$ [au]')
+        ax.set_ylabel('$\Sigma_\mathrm{gas}$ [g/cm$^3$]')
+
+    plt.show()
+
+    return locals()
+
+
 if __name__ == '__main__':
-    main()
+    res = main()
