@@ -184,6 +184,64 @@ def gas_timestep_active_dead(dt, x, T, sig_g, sig_thresh=200.0,
     return sig, alpha
 
 
+def gas_timestep_active_dead_avg(
+        dt, x, T, sig_g, sig_thresh=200.0, alpha_active=1e-2, alpha_dead=1e-4,
+        dsigma=20.0):
+    """
+    Does a layered accretion gas time step, distinguishing between active
+    and dead layer
+
+    Arguments:
+    ----------
+
+    dt : float
+        length of time step [s]
+
+    x, T, sig_g : arrays
+        radial grid x and on this grid: temperature T [K] and surface density
+        sig_g [g/cm^2]
+
+    sig_thresh : float
+        at which gas surface density to transition from active to dead
+
+    alpha_active, alpha_dead : float
+        active and dead-zone alpha values
+
+    Output:
+    -------
+
+    sig, alpha
+
+    sig : array
+        updated gas surface density
+
+    alpha : array
+        mid-plane gas surface density
+    """
+
+    # find the active and dead surface densities
+
+    sigma_active = np.minimum(sig_g, sig_thresh)
+    sigma_dead = np.maximum(sig_g - sigma_active, 1e-100)
+
+    # assign the active and dead alpha values
+
+    alpha_a = alpha_active * np.ones_like(x)
+    alpha_d = calc_alpha(x, sig_g, alpha_dead=alpha_dead,
+                         alpha_active=alpha_active, sig_dz=sig_thresh, dsigma=dsigma)
+    alpha_d = smooth_alpha(alpha_d, stencil=3)
+
+    # calculate an averaged alpha
+
+    alpha_mean = (alpha_a * sigma_active + alpha_d * sigma_dead) / (sig_g)
+
+    # evolve the two surface densities separately
+
+    sig = gas_timestep(dt, x, alpha_mean, T, sig_g)
+
+    return sig, alpha_mean
+
+
 def gas_timestep(dt, x, alpha, T, sig_g):
     """
     Does an implicit time step for the gas surface density:
@@ -215,9 +273,13 @@ def gas_timestep(dt, x, alpha, T, sig_g):
     h_gas = np.ones(nr)
     K_gas = np.zeros(nr)
     L_gas = np.zeros(nr)
-    p_L = -(x[1] - x[0]) * h_gas[1] / (x[1] * g_gas[1])
-    q_L = 1. / x[0] - 1. / x[1] * g_gas[0] / g_gas[1] * h_gas[1] / h_gas[0]
-    r_L = 0.0
+    # p_L = -(x[1] - x[0]) * h_gas[1] / (x[1] * g_gas[1])
+    # q_L = 1. / x[0] - 1. / x[1] * g_gas[0] / g_gas[1] * h_gas[1] / h_gas[0]
+    # r_L = 0.0
+
+    p_L = 1.0
+    q_L = - (g_gas[1] / h_gas[1] - g_gas[0] / h_gas[0]) / (x[1] - x[0])
+    r_L = g_gas[0] / h_gas[0] * (u_gas[1] - u_gas[0]) / (x[1] - x[0])
 
     u_gas = impl_donorcell_adv_diff_delta(nr, x, D_gas, v_gas, g_gas, h_gas, K_gas, L_gas,
                                           u_gas, dt, p_L, 0.0, q_L, 1.0, r_L, 1e-100 * x[nr - 1])
@@ -363,20 +425,15 @@ def impl_donorcell_adv_diff_delta(n_x, x, Diff, v, g, h, K, L, u_in, dt, pl, pr,
         vol = 0.5 * (x[i + 1] - x[i - 1])
         A[i] = -dt / vol *  \
             (
-            max(0., v[i]) +
-            D05[i] * h05[i] * g[i - 1] / ((x[i] - x[i - 1]) * h[i - 1])
+            max(0., v[i]) + D05[i] * h05[i] * g[i - 1] / ((x[i] - x[i - 1]) * h[i - 1])
             )
         B[i] = 1. - dt * L[i] + dt / vol * \
             (
-            max(0., v[i + 1]) -
-            min(0., v[i]) +
-            D05[i + 1] * h05[i + 1] * g[i] / ((x[i + 1] - x[i]) * h[i]) +
-            D05[i] * h05[i] * g[i] / ((x[i] - x[i - 1]) * h[i])
+            max(0., v[i + 1]) - min(0., v[i]) + D05[i + 1] * h05[i + 1] * g[i] / ((x[i + 1] - x[i]) * h[i]) + D05[i] * h05[i] * g[i] / ((x[i] - x[i - 1]) * h[i])
             )
         C[i] = dt / vol *  \
             (
-            min(0., v[i + 1]) -
-            D05[i + 1] * h05[i + 1] * g[i + 1] / ((x[i + 1] - x[i]) * h[i + 1])
+            min(0., v[i + 1]) - D05[i + 1] * h05[i + 1] * g[i + 1] / ((x[i + 1] - x[i]) * h[i + 1])
             )
         D[i] = -dt * K[i]
     #
@@ -419,8 +476,12 @@ def main():
     nr = 1000
     nt = 2000
 
-    xi = np.logspace(-1, 3, nr + 1) * au
-    x = 0.5 * (xi[1:] + xi[:-1])
+    # xi = np.logspace(-1, 3, nr + 1) * au
+    # x = 0.5 * (xi[1:] + xi[:-1])
+
+    x = np.logspace(-1, 3, nr + 2) * au
+    xi = 0.5 * (x[1:] + x[:-1])
+    x = x[1:-1]
 
     time = np.logspace(-1, 6, nt - 1) * year
 
@@ -444,7 +505,7 @@ def main():
         dt = time[it + 1] - time[it]
 
         # sig = gas_timestep(dt, x, alpha, T, sig)
-        sig, alpha = gas_timestep_active_dead(dt, x, T, sig, dsigma=5.0)
+        sig, alpha = gas_timestep_active_dead_avg(dt, x, T, sig, dsigma=5.0)
         sig_g[it + 1] = sig
         alpha_out[it + 1] = alpha
 
@@ -453,13 +514,13 @@ def main():
     if has_widget:
         widget.plotter(x / au, sig_g, data2=[alpha_out], times=time / year,
                        xlog=True, ylog=True, ylim=[1e-4, 1e4],
-                       xlabel='$r$ [au]', ylabel='$\Sigma_\mathrm{g}$ [g cm$^{-2}$]')
+                       xlabel='$r$ [au]', ylabel=r'$\Sigma_\mathrm{g}$ [g cm$^{-2}$]')
     else:
         f, ax = plt.subplots()
         ax.loglog(x / au, sig_g[-1])
         ax.set_ylim(1e-4, 1e4)
         ax.set_xlabel('$r$ [au]')
-        ax.set_ylabel('$\Sigma_\mathrm{gas}$ [g/cm$^3$]')
+        ax.set_ylabel(r'$\Sigma_\mathrm{gas}$ [g/cm$^3$]')
 
     plt.show()
 
